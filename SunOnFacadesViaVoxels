@@ -1,0 +1,284 @@
+# Import required libraries
+import xml.etree.ElementTree as ET
+import requests
+import zipfile
+import io
+import pandas as pd
+import numpy as np
+from geopy.geocoders import Nominatim
+from geopy.distance import geodesic
+from pyproj import Transformer
+import re
+import rhino3dm as rg
+import matplotlib.pyplot as plt
+
+# Function to fetch KML content
+def fetch_kml_content(kml_url):
+    response = requests.get(kml_url)
+    if response.status_code != 200:
+        raise Exception(f"Failed to fetch KML file. Status code: {response.status_code}")
+    return response.content
+
+# Function to parse KML and extract URLs
+def parse_kml(kml_content):
+    root = ET.fromstring(kml_content)
+    namespaces = {'kml': 'http://earth.google.com/kml/2.1'}
+    placemarks = []
+    for placemark in root.findall('.//kml:Placemark', namespaces):
+        name = placemark.find('kml:name', namespaces)
+        name = name.text if name is not None else "Unknown"
+        description = placemark.find('kml:description', namespaces)
+        description_text = description.text if description is not None else ""
+        point = placemark.find('.//kml:coordinates', namespaces)
+        if point is not None:
+            coordinates = point.text.split(',')
+            if len(coordinates) >= 2:
+                lon, lat = map(float, coordinates[:2])
+                alt = float(coordinates[2]) if len(coordinates) > 2 else 0.0
+                url = None
+                if description_text:
+                    url_match = re.search(r'URL\s*(.*?)</td>', description_text, re.IGNORECASE | re.DOTALL)
+                    if url_match:
+                        url = url_match.group(1).strip()
+                placemarks.append({
+                    'name': name,
+                    'lat': lat,
+                    'lon': lon,
+                    'alt': alt,
+                    'url': url
+                })
+    return placemarks
+
+# Function to find the nearest location
+def find_nearest_location(placemarks, target_lat, target_lon):
+    nearest = min(placemarks, key=lambda p: geodesic((target_lat, target_lon), (p['lat'], p['lon'])).km)
+    return nearest
+
+# Function to download and extract zip file
+def download_and_extract(url):
+    response = requests.get(url)
+    with zipfile.ZipFile(io.BytesIO(response.content)) as zip_ref:
+        epw_file = [file for file in zip_ref.namelist() if file.endswith('.epw')][0]
+        with zip_ref.open(epw_file) as f:
+            df = pd.read_csv(f, header=None, names=[
+                'Year', 'Month', 'Day', 'Hour', 'Minute', 'Data Source and Uncertainty Flags',
+                'Dry Bulb Temperature', 'Dew Point Temperature', 'Relative Humidity',
+                'Atmospheric Station Pressure', 'Extraterrestrial Horizontal Radiation',
+                'Extraterrestrial Direct Normal Radiation', 'Horizontal Infrared Radiation Intensity',
+                'Global Horizontal Radiation', 'Direct Normal Radiation', 'Diffuse Horizontal Radiation',
+                'Global Horizontal Illuminance', 'Direct Normal Illuminance', 'Diffuse Horizontal Illuminance',
+                'Zenith Luminance', 'Wind Direction', 'Wind Speed', 'Total Sky Cover',
+                'Opaque Sky Cover', 'Visibility', 'Ceiling Height', 'Present Weather Observation',
+                'Present Weather Codes', 'Precipitable Water', 'Aerosol Optical Depth',
+                'Snow Depth', 'Days Since Last Snowfall', 'Albedo', 'Liquid Precipitation Depth',
+                'Liquid Precipitation Quantity'
+            ], skiprows=8)
+    return df
+
+# Function to extract building facades from the 3DM file (as curves)
+def extract_building_facades(filepath, layer_name="Building_Facade"):
+    model = rg.File3dm.Read(filepath)
+    facades = []
+    for obj in model.Objects:
+        if model.Layers[obj.Attributes.LayerIndex].Name == layer_name:
+            geom = obj.Geometry
+            if isinstance(geom, rg.Curve):  # Process curves
+                facades.append(geom)
+    if not facades:
+        raise Exception(f"No facades found in the '{layer_name}' layer.")
+    return facades
+
+# Voxelization function
+def calculate_bounding_box(curve):
+    """Calculate bounding box for a PolylineCurve manually."""
+    points = [curve.Point(i) for i in range(curve.PointCount)]
+    min_x = min(pt.X for pt in points)
+    min_y = min(pt.Y for pt in points)
+    min_z = min(pt.Z for pt in points)
+
+    max_x = max(pt.X for pt in points)
+    max_y = max(pt.Y for pt in points)
+    max_z = max(pt.Z for pt in points)
+
+    bbox_min = np.array([min_x, min_y, min_z])
+    bbox_max = np.array([max_x, max_y, max_z])
+    
+    return bbox_min, bbox_max
+
+# Updated Voxelization function for unified grid
+def voxelize_buildings(building_geometries, voxel_size=1.0):
+    """Voxelize all buildings into a single grid."""
+    all_bboxes = [calculate_bounding_box(geom) for geom in building_geometries]
+    
+    # Determine the global bounding box for all buildings
+    global_bbox_min = np.min([bbox_min for bbox_min, _ in all_bboxes], axis=0)
+    global_bbox_max = np.max([bbox_max for _, bbox_max in all_bboxes], axis=0)
+    
+    # Calculate the global voxel grid dimensions
+    global_grid_shape = np.ceil((global_bbox_max - global_bbox_min) / voxel_size).astype(int)
+    
+    # Initialize the global voxel grid
+    global_voxel_grid = np.zeros(global_grid_shape, dtype=bool)
+    
+    for building_geometry, (bbox_min, bbox_max) in zip(building_geometries, all_bboxes):
+        for i in range(building_geometry.PointCount):
+            point = building_geometry.Point(i)
+            voxel_index = np.floor((np.array([point.X, point.Y, point.Z]) - global_bbox_min) / voxel_size).astype(int)
+            global_voxel_grid[tuple(voxel_index)] = True
+    
+    return global_voxel_grid, global_bbox_min, global_bbox_max
+
+
+# Sunlight hours calculation using voxel grid
+from tqdm import tqdm
+
+# Updated Sunlight hours calculation using voxel grid and actual sun positions
+def calculate_sunlight_hours(buildings_voxel_grid, sun_positions, voxel_size):
+    """Calculate sunlight hours based on voxelized building grids and sun positions."""
+    sunlight_hours = np.zeros_like(buildings_voxel_grid, dtype=int)
+
+    # Iterate over all sun positions
+    for sun_pos in tqdm(sun_positions, desc="Processing Sun Positions"):
+        shadow_mask = np.zeros_like(buildings_voxel_grid, dtype=bool)
+
+        # Project the shadow onto the voxel grid based on the sun position
+        for x in range(buildings_voxel_grid.shape[0]):
+            for y in range(buildings_voxel_grid.shape[1]):
+                for z in range(buildings_voxel_grid.shape[2]):
+                    if buildings_voxel_grid[x, y, z]:
+                        shadow_x, shadow_y, shadow_z = x, y, z
+
+                        while (0 <= shadow_x < buildings_voxel_grid.shape[0] and
+                               0 <= shadow_y < buildings_voxel_grid.shape[1] and
+                               0 <= shadow_z < buildings_voxel_grid.shape[2]):
+                            if (0 <= shadow_x < buildings_voxel_grid.shape[0] and
+                                0 <= shadow_y < buildings_voxel_grid.shape[1] and
+                                0 <= shadow_z < buildings_voxel_grid.shape[2]):
+                                shadow_mask[shadow_x, shadow_y, shadow_z] = True
+
+                            shadow_x += int(np.sign(sun_pos[0]))
+                            shadow_y += int(np.sign(sun_pos[1]))
+                            shadow_z += int(np.sign(sun_pos[2]))
+
+                            if not (0 <= shadow_x < buildings_voxel_grid.shape[0] and
+                                    0 <= shadow_y < buildings_voxel_grid.shape[1] and
+                                    0 <= shadow_z < buildings_voxel_grid.shape[2]):
+                                break
+        
+        # Final sun exposure calculation
+        sunlight_hours += (~shadow_mask).astype(int)
+
+    return sunlight_hours
+
+
+
+
+
+
+
+
+
+
+
+# Create a new layer and visualize the sunlight exposure on the facades
+def create_sunlight_layer(voxel_grid, sunlight_hours, voxel_size=1.0):
+    color_map = plt.get_cmap('viridis')
+    max_sun_hours = np.max(sunlight_hours)
+    
+    for (x, y, z), sun_hours in np.ndenumerate(sunlight_hours):
+        if voxel_grid[x, y, z]:
+            color = color_map(sun_hours / max_sun_hours)
+            print(f"Voxel at ({x}, {y}, {z}) Sunlight Hours: {sun_hours}, Color: {color}")
+            # Normally you would visualize this in Rhino or another 3D environment
+
+# Function to extract sun positions from EPW data
+def extract_sun_positions(df, month, start_day, end_day):
+    """Extract sun positions (azimuth and altitude) from EPW data for the given date range."""
+    sun_positions = []
+    for index, row in df.iterrows():
+        if row['Month'] == month and start_day <= row['Day'] <= end_day:
+            # Convert the solar data to Cartesian coordinates
+            azimuth_rad = np.deg2rad(row['Wind Direction'])  # Assuming wind direction is used as azimuth
+            altitude_rad = np.deg2rad(row['Zenith Luminance'])  # Assuming zenith luminance as altitude (not accurate)
+            x = np.cos(altitude_rad) * np.sin(azimuth_rad)
+            y = np.cos(altitude_rad) * np.cos(azimuth_rad)
+            z = np.sin(altitude_rad)
+            sun_positions.append(np.array([x, y, z]))
+    return sun_positions
+
+# Run the analysis for all buildings in the model
+def run_sunlight_analysis(filepath, sun_positions, voxel_size=1.0):
+    facades = extract_building_facades(filepath)
+    buildings_voxel_grid, _, _ = voxelize_buildings(facades, voxel_size)
+
+    sunlight_hours = calculate_sunlight_hours(buildings_voxel_grid, sun_positions, voxel_size)
+    create_sunlight_layer(buildings_voxel_grid, sunlight_hours, voxel_size)
+
+# Function to run the entire analysis process
+def run_analysis(kml_url, location, month, start_day, end_day):
+    print(f"Fetching KML file from: {kml_url}")
+    try:
+        kml_content = fetch_kml_content(kml_url)
+    except Exception as e:
+        print(f"Error fetching KML file: {str(e)}")
+        return
+
+    print(f"Parsing KML file for location: {location}")
+    placemarks = parse_kml(kml_content)
+
+    if not placemarks:
+        print("No placemarks found in the KML file. Cannot proceed with analysis.")
+        return
+
+    print(f"Found {len(placemarks)} placemarks in the KML file.")
+
+    geolocator = Nominatim(user_agent="climate_analysis_app")
+    location_info = geolocator.geocode(location)
+
+    if location_info is None:
+        print(f"Could not find coordinates for the location: {location}")
+        return
+
+    target_lat, target_lon = location_info.latitude, location_info.longitude
+    nearest_location = find_nearest_location(placemarks, target_lat, target_lon)
+
+    print(f"Nearest weather station: {nearest_location['name']}")
+    print(f"Coordinates: {nearest_location['lat']}, {nearest_location['lon']}")
+    print(f"URL: {nearest_location['url']}")
+
+    if nearest_location['url'] is None:
+        print("Error: No URL found for the nearest weather station.")
+        return
+
+    try:
+        df = download_and_extract(nearest_location['url'])
+    except Exception as e:
+        print(f"Error downloading or extracting data: {str(e)}")
+        return
+
+    if df.empty:
+        print("No data extracted from the zip file. Please check the file contents.")
+        return
+
+    print("Data shape:", df.shape)
+    print("Columns:", df.columns)
+    print("Data types:", df.dtypes)
+    print("NaN values:\n", df.isna().sum())
+
+    # Extract sun positions for the specified date range
+    sun_positions = extract_sun_positions(df, month, start_day, end_day)
+
+    # Run the sunlight analysis with the EPW data and a Rhino 3DM file
+    filepath = '/content/drive/MyDrive/GSAPP-Desktop/Downloads/nyc_3dmodel_qn09_1/QN09_block.3dm'
+    run_sunlight_analysis(filepath, sun_positions)
+
+    print("Sunlight analysis completed.")
+
+# Example usage
+kml_url = 'https://climate.onebuilding.org/WMO_Region_4_North_and_Central_America/Region4_USA_EPW_Processing_locations.kml'
+location = 'New York, NY'
+month = 7  # July
+start_day = 1
+end_day = 1
+
+run_analysis(kml_url, location, month, start_day, end_day)
